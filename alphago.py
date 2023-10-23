@@ -1,9 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-One-player Alpha Go
-@author: Tuan Dam, TU Darmstadt
-"""
 import numpy as np
 from numpy.random import seed
 import argparse
@@ -21,6 +15,14 @@ plt.style.use('ggplot')
 from helpers import (argmax,is_atari_game,copy_atari_state,store_safely,restore_atari_state,stable_normalizer,power)
 from dqn_net import Network
 from set_weights import set_weights
+
+import os
+import torch.multiprocessing as mp
+import time
+
+torch.set_num_threads(1)
+
+start = time.time()
 
 def alien(Env,cuda):
     model = torch.load('models/alien.torch', map_location=torch.device('cuda') if cuda else torch.device('cpu'))
@@ -171,11 +173,15 @@ def load_atari_game(argument,Env,cuda):
         'SeaquestNoFrameskip-v4': seaquest,
         'SpaceInvadersNoFrameskip-v4': space_invaders
     }
+
+
     # Get the function from switcher dictionary
     func = switcher.get(argument, lambda: "Invalid game")
     # Execute the function
     model = func(Env,cuda)
     return model
+
+
 
 ##### MCTS functions #####
 class Action():
@@ -192,10 +198,24 @@ class Action():
         self.algorithm = algorithm
         self.p = p
 
+        min_value = 0
+        max_value = 0.0001
+        num_atoms = 20
+        self.atoms = num_atoms
+        self.support = np.linspace(min_value, max_value, num_atoms)
+        self.categorical_distribution = np.zeros(num_atoms)
+    
     def add_child_state(self,s1,r,terminal,model):
         self.child_state = State(s1,r,terminal,self,self.parent_state.na,model,tau=self.tau,epsilon=self.epsilon,
                                  lambda_const= self.lambda_const,algorithm=self.algorithm,p=self.p)
         return self.child_state
+    
+    def sample_from_distribution(self):
+        if np.sum(self.categorical_distribution) == 0:
+            return self.Q
+        distribution = self.categorical_distribution / np.sum(self.categorical_distribution)
+        sampled_value = np.random.choice(self.support, p=distribution)
+        return sampled_value
 
     def update(self,R):
         self.n += 1
@@ -203,6 +223,26 @@ class Action():
         if self.algorithm == 'uct' or self.algorithm == 'power-uct':
             self.W += R
             self.Q = self.W/self.n
+        if self.algorithm == "TS" or self.algorithm == "UCB-TS":
+            self.W += R
+            self.Q = self.W/self.n
+
+            support = self.support
+            num_atoms = self.atoms
+            new_value = self.Q
+            if new_value < support[0] or new_value > support[-1]:
+                new_support = np.linspace(min(support[0], new_value), max(support[-1], new_value), num_atoms)
+                new_categorical_distribution = np.zeros(num_atoms)
+                for i, value in enumerate(support):
+                    new_categorical_distribution[np.argmin(np.abs(new_support - value))] = self.categorical_distribution[i]
+                self.support = new_support
+                self.categorical_distribution = new_categorical_distribution
+            
+            nearest_bin_index = np.argmin(np.abs(self.support - new_value))
+            self.categorical_distribution[nearest_bin_index] += 1
+            
+
+
         elif self.algorithm == 'maxmcts':
             delta = R - self.Q
             self.Q += delta / self.n
@@ -236,6 +276,15 @@ class State():
             uct = np.array([child_action.Q + prior * c * (np.sqrt(self.n + 1)/(child_action.n + 1)) for child_action,prior
                             in zip(self.child_actions,self.priors)])
             winner = np.argmax(uct)
+        elif self.algorithm == "TS": 
+            #print([child_action for child_action in self.child_action])
+            uct = np.array([child_action.sample_from_distribution() + prior for child_action,prior in zip(self.child_actions,self.priors)])
+            winner = np.argmax(uct)
+        elif self.algorithm == "UCB-TS":
+            uct = np.array([child_action.sample_from_distribution() + prior * c * (np.sqrt(self.n + 1)/(child_action.n + 1)) for child_action,prior
+                            in zip(self.child_actions,self.priors)])
+            winner = np.argmax(uct)
+        
         elif self.algorithm == 'rents':
             random = rand()
             Qs = [child_action.Q for child_action in self.child_actions]
@@ -303,6 +352,7 @@ class State():
         self.Q = self.model(self.index)
 
         Q_value = np.squeeze(self.Q.detach().cpu().numpy())
+
         if self.algorithm == 'rents':
             max_Q = np.max(self.Q.detach().cpu().numpy())
             uct = np.exp((self.Q.detach().cpu().numpy() - max_Q) / self.tau)
@@ -372,6 +422,7 @@ class State():
             self.child_actions = [
                 Action(a, parent_state=self, Q_init=(Q_value[a] - self.V)/self.tau,tau=self.tau,epsilon=self.epsilon,
                        lambda_const=self.lambda_const,algorithm=self.algorithm, p=self.p) for a in range(self.na)]
+
         else:
             self.V = np.mean(self.Q.detach().cpu().numpy())
             self.priors = softmax(self.Q.detach().cpu().numpy() / self.tau)
@@ -459,6 +510,7 @@ class MCTS():
             snapshot = copy_atari_state(Env) # for Atari: snapshot the root at the beginning
 
         for i in range(n_mcts):
+            #print("MCTS STEP : ",i)
             state = self.root # reset to root for new trace
             if not is_atari:
                 mcts_env = copy.deepcopy(Env) # copy original Env to rollout from
@@ -476,7 +528,7 @@ class MCTS():
                 else:
                     state = action.add_child_state(s1,r,t,self.model) # expand
                     break
-
+            #breakpoint()
             # Back-up
             R = state.V
             while state.parent_action is not None: # loop back-up until root is reached
@@ -486,6 +538,15 @@ class MCTS():
                 action = state.parent_action
                 action.update(R)
                 state = action.parent_state
+                
+                
+                # print([c.n for c in state.child_actions])
+                # print([c.W for c in state.child_actions])
+                # print([child_action.Q + prior * c * (np.sqrt(state.n + 1)/(child_action.n + 1)) for child_action,prior
+                #             in zip(state.child_actions,state.priors)])
+                # print([(child_action.Q + 0.25*c*(np.sqrt(state.n + 1)/(child_action.n + 1))) for child_action in state.child_actions])
+
+
                 if self.algorithm == 'maxmcts':
                     Q = [child_action.Q for child_action in state.child_actions]
                     a = np.argmax(Q)
@@ -527,7 +588,8 @@ class MCTS():
             sp_max = (np.sum(Q_sp_max) - 1) / K_sum
             pi_target = [np.maximum(Q - sp_max, 0) for Q in Qs]
             pi_target = pi_target / np.sum(pi_target)
-        elif self.algorithm == 'uct' or self.algorithm == 'power-uct' or self.algorithm == 'maxmcts':
+        elif self.algorithm == 'uct' or self.algorithm == 'power-uct' or self.algorithm == 'maxmcts' or \
+            self.algorithm == "TS" or self.algorithm == "UCB-TS":
             pi_target = stable_normalizer(counts, temp)
 
         return self.root.index,pi_target,V_target
@@ -547,21 +609,22 @@ class MCTS():
             self.root = self.root.child_actions[a].child_state
 
 #### Agent ##
-def agent(algorithm,game,n_ep,n_mcts,max_ep_len,c,p,gamma,temp,tau,epsilon,lambda_const):
+def agent(algorithm,game,n_ep,n_mcts,max_ep_len,c,p,gamma,temp,tau,epsilon,lambda_const): 
     ''' Outer training loop '''
     #tf.reset_default_graph()
     episode_returns = [] # storage
     timepoints = []
     # Environments
     Env = Atari(game)
+    
     is_atari = is_atari_game(Env)
     mcts_env = Atari(game)
-
+    
     model = load_atari_game(game,Env,args.cuda)
 
     t_total = 0 # total steps
     R_best = -np.Inf
-
+    
     for ep in range(n_ep):
         start = time.time()
         s = Env.reset()
@@ -577,11 +640,21 @@ def agent(algorithm,game,n_ep,n_mcts,max_ep_len,c,p,gamma,temp,tau,epsilon,lambd
                     gamma=gamma,tau=tau,epsilon=epsilon,lambda_const=lambda_const,algorithm=algorithm,p=p)  # the object responsible for MCTS searches
         for t in range(max_ep_len):
             # MCTS step
+            #print("GAME STEP : ",t)
             mcts.search(n_mcts=n_mcts, c=c, Env=Env, mcts_env=mcts_env)  # perform a forward search
+            distributions = np.array([(child_action.categorical_distribution,child_action.support)  for child_action in mcts.root.child_actions])
+            
+            #for dist, support in distributions:
+            #     print(f"Distribution : ")
+            #     print(f"{dist}")
+            #     print("Support : ")
+            #     print([round(i,2) for i in support])
+            # print("_____")
+            
             state, pi, V = mcts.return_results(temp)  # extract the root output
 
             # Make the true step
-            if algorithm == 'uct' or algorithm == 'power-uct' or algorithm == 'maxmcts':
+            if algorithm == 'uct' or algorithm == 'power-uct' or algorithm == 'maxmcts' or algorithm == "TS" or algorithm == "UCB-TS":
                 a = np.random.choice(len(pi), p=pi)
             else:
                 a = np.argmax(pi)
@@ -605,19 +678,42 @@ def agent(algorithm,game,n_ep,n_mcts,max_ep_len,c,p,gamma,temp,tau,epsilon,lambd
             a_best = a_store
             seed_best = seed
             R_best = R
-        print('Finished episode {}, total return: {}, total time: {} sec'.format(ep, np.round(R, 2),
-                                                                                 np.round((time.time() - start), 1)))
+        print('Finished game {} algorithm {}, total return: {}, total time: {} sec'.format(game, algorithm, np.round(R, 2),
+                                                                                np.round((time.time() - start), 1)))
 
     # Return results
     return episode_returns, timepoints, a_best, seed_best, R_best
 
 #### Command line call, parsing and plotting ##
 
+def experiment(algorithm,game,seed,n_mcts,max_ep_len,c,p,gamma,temp,tau,epsilon,lambda_const):
+    print(f"Starting {game} , Algorithm : {algorithm}, Seed : {seed}")
+    timestamp = str(time.time())[:6]
+    episode_returns,timepoints,a_best,seed_best,R_best = agent(algorithm=algorithm, game=game,
+                                                                n_ep=1, n_mcts=n_mcts,
+                                                                max_ep_len=max_ep_len, c=c, p=p, gamma=gamma,
+                                                                temp=temp, tau=tau,
+                                                                epsilon=epsilon, lambda_const=lambda_const)
+
+    folder_name = game[:6]
+    path = os.getcwd() + '/logs/dist/' + folder_name
+    if not os.path.exists(path):
+        os.mkdir(path)
+    filename = os.getcwd() + f'/logs/dist/{folder_name}/' + game + '_' + algorithm + '.txt' + str(tau) + '_' + \
+            str(epsilon) + f"_seed_{seed}"
+    file = open(filename,"w+")
+
+    for reward in episode_returns:
+        file.write(str(reward) + "\n")
+
+    file.close()
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--algorithm', default='uct',help='uct/power-uct/maxmcts/rents/ments')
     parser.add_argument('--game', default='breakout',help='Training environment')
-    parser.add_argument('--n_ep', type=int, default=5, help='Number of episodes')
+    parser.add_argument('--n_ep', type=int, default=1, help='Number of episodes')
     parser.add_argument('--n_mcts', type=int, default=512, help='Number of MCTS traces per step')
     parser.add_argument('--max_ep_len', type=int, default=2000, help='Maximum number of steps per episode')
     parser.add_argument('--c', type=float, default=1.5, help='uct constant')
@@ -629,17 +725,97 @@ if __name__ == '__main__':
     parser.add_argument('--gamma', type=float, default=0.99, help='Discount parameter')
     parser.add_argument('--number', type=int, default=1, help='Iteration number')
     parser.add_argument('--cuda', default=False,action='store_true')
-
     args = parser.parse_args()
-    episode_returns,timepoints,a_best,seed_best,R_best = agent(algorithm=args.algorithm,game=args.game,n_ep=args.n_ep,n_mcts=args.n_mcts,
-                                        max_ep_len=args.max_ep_len,c=args.c,p=args.p,gamma=args.gamma,
-                                        temp=args.temp,tau=args.tau,epsilon=args.epsilon,lambda_const=args.lambda_const)
 
-    filename = os.getcwd() + '/logs/' + args.game + '_' + args.algorithm + '.txt' + str(args.tau) + '_' + \
-               str(args.epsilon) + '_' + str(args.number)
-    file = open(filename,"w+")
+    pool = mp.Pool(processes=14)
 
-    for reward in episode_returns:
-        file.write(str(reward) + "\n")
+    # games = ["AlienNoFrameskip-v4", 
+    #         "EnduroNoFrameskip-v4"
+    #         "BreakoutNoFrameskip-v4",
+    #         "RobotankNoFrameskip-v4",
+    #         "SeaquestNoFrameskip-v4"]
+    
+    # games = ["EnduroNoFrameskip-v4"
+    #         "BreakoutNoFrameskip-v4",
+    #         "SpaceInvadersNoFrameskip-v4",
+    #         'DemonAttackNoFrameskip-v4',
+    #         "PhoenixNoFrameskip-v4",
+    #         'MsPacmanNoFrameskip-v4',
+    #         'NetsNoFrameskip-v4',
+    #         'PitfallNoFrameskip-v4',
+    #         'AsterixNoFrameskip-v4',
+    #         'BeamRiderNoFrameskip-v4']
+        
+    # games = ["AmidarNoFrameskip-v4",
+    #         "AsteroidsNoFrameskip",
+    #         "KrullNoFrameskip-v4",
+    #         "SolarisNoFrameskip-v4"]
 
-    file.close()
+        # 'BankHeistNoFrameskip-v4': bank_heist,
+        # 'BowlingNoFrameskip-v4': bowling,
+        # 'CentipedeNoFrameskip-v4': centipede,
+        # 'GopherNoFrameskip-v4': gopher,
+        # 'WizardOfWorNoFrameskip-v4': wizard_of_wor,
+        # 'AtlantisNoFrameskip-v4': atlantis,
+        # 'FreewayNoFrameskip-v4': freeway,
+        # 'FrostbiteNoFrameskip-v4': frostbite,
+        # 'HeroNoFrameskip-v4': hero,
+        # 'NetsNoFrameskip-v4': nets,
+        # 'QbertNoFrameskip-v4': qbert,
+
+
+    # games = ["WizardOfWorNoFrameskip-v4",
+    # "BankHeistNoFrameskip-v4",
+    # "EnduroNoFrameskip-v4",
+    # "BreakoutNoFrameskip-v4"]
+
+    games = [
+        'PhoenixNoFrameskip-v4',
+        'MsPacmanNoFrameskip-v4',
+        'AlienNoFrameskip-v4',
+        'SpaceInvadersNoFrameskip-v4',
+        'BeamRiderNoFrameskip-v4',
+        'DemonAttackNoFrameskip-v4',
+        'AsterixNoFrameskip-v4',
+        'RobotankNoFrameskip-v4',
+        'SeaquestNoFrameskip-v4',
+        'KrullNoFrameskip-v4',
+        'SolarisNoFrameskip-v4',
+        'AsteroidsNoFrameskip-v4',
+        'QbertNoFrameskip-v4',
+        'BowlingNoFrameskip-v4',
+        'EnduroNoFrameskip-v4',
+        'AtlantisNoFrameskip-v4',
+        'GopherNoFrameskip-v4',
+        'HeroNoFrameskip-v4',
+        'FrostbiteNoFrameskip-v4',
+        'WizardOfWorNoFrameskip-v4',
+        'FreewayNoFrameskip-v4',
+        'BreakoutNoFrameskip-v4'
+    ]
+    
+    algorithms = ["uct", "TS", "UCB-TS"]
+    for game in games:
+        for algorithm in algorithms:
+            for seed in range(args.n_ep):
+                # experiment(algorithm=algorithm,game=game,n_ep=args.n_ep,n_mcts=args.n_mcts,
+                #                         max_ep_len=args.max_ep_len,c=args.c,p=args.p,gamma=args.gamma,
+                #                         temp=args.temp,tau=args.tau,epsilon=args.epsilon,lambda_const=args.lambda_const)
+                    pool.apply_async(experiment,
+                            args = (algorithm,
+                            game,
+                            seed,
+                            args.n_mcts,
+                            args.max_ep_len,
+                            args.c,
+                            args.p,
+                            args.gamma,
+                            args.temp,
+                            args.tau,
+                            args.epsilon,
+                            args.lambda_const))
+    pool.close()
+    pool.join()
+
+
+print('Duration : ', time.time()-start, 'seconds.')

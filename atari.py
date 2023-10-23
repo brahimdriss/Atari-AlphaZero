@@ -177,7 +177,7 @@ class Atari(Environment):
         """
         self._episode_ends_at_life = ends_at_life
 
-    def _preprocess_observation(self, obs):
+    def _preprocess_observation(self, obs):        
         image = cv2.cvtColor(obs, cv2.COLOR_RGB2GRAY)
         image = cv2.resize(image, self.img_size,
                            interpolation=cv2.INTER_LINEAR)

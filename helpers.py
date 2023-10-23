@@ -1,9 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Helpers
-@author: thomas
-"""
 import numpy as np
 import random
 from numpy.random import rand

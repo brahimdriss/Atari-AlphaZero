@@ -1,15 +1,32 @@
-First we must install conda 4.7.12
+* Create conda environment (or venv) :
+    
+    conda create -n test_env python=3.7 anaconda
 
-Then
+* Install dependencies : 
 
-conda create -n test_env python=3.7 anaconda
+    conda activate test_env
 
-conda activate test_env
+    pip install -r requirements.txt
 
-conda install pytorch
+    conda install pytorch torchvision cudatoolkit=11.3 -c pytorch -c conda-forge
 
-pip install --user mushroom-rl
+    pip install mushroom-rl==1.4.0
 
-pip install --user gym
+    pip install gym==0.10.8
 
-pip install --user gym[atari]
+    pip install gym[atari]==0.10.8
+
+    pip install autorom[accept-rom-license]
+
+    pip install opencv-python==4.0.0.21
+
+* Install atari roms :
+
+    wget http://www.atarimania.com/roms/Roms.rar
+
+    mkdir /content/ROM/
+    
+    unrar e /content/Roms.rar /content/ROM/
+    
+    python -m atari_py.import_roms /content/ROM/
+
