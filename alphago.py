@@ -201,9 +201,17 @@ class Action():
         min_value = 0
         max_value = 0.0001
         num_atoms = 20
+        precision = 4
+
+        self.precision = precision
         self.atoms = num_atoms
         self.support = np.linspace(min_value, max_value, num_atoms)
-        self.categorical_distribution = np.zeros(num_atoms)
+        if self.algorithm == "MTS":
+            self.categorical_distribution = np.ones(num_atoms)
+        else:
+            self.categorical_distribution = np.zeros(num_atoms)
+        if self.algorithm == "NPTS":
+            self.support = {}
     
     def add_child_state(self,s1,r,terminal,model):
         self.child_state = State(s1,r,terminal,self,self.parent_state.na,model,tau=self.tau,epsilon=self.epsilon,
@@ -217,31 +225,63 @@ class Action():
         sampled_value = np.random.choice(self.support, p=distribution)
         return sampled_value
 
+    def sample_dirichilet(self):
+        # print(self.categorical_distribution)
+        # print(self.support)
+        if np.sum(self.categorical_distribution) == self.atoms:
+            return self.Q
+        w = np.random.dirichlet(self.categorical_distribution)
+        # print(w)
+        return w @ self.support 
+    
+    def sample_dirichilet_npts(self):
+        support = list(self.support.keys())
+        if len(support) < 1:
+            return self.Q
+        categorical = list(self.support.values())
+        w = np.random.dirichlet(categorical)
+        # print("Support = ", support)
+        # print("Categorical = ", categorical)
+        # print("w = ",w)
+        # print("Res = ", w @ support)
+        # print("____")
+        return w @ support
+
     def update(self,R):
         self.n += 1
         self.Q = R
         if self.algorithm == 'uct' or self.algorithm == 'power-uct':
             self.W += R
             self.Q = self.W/self.n
-        if self.algorithm == "TS" or self.algorithm == "UCB-TS":
+        if self.algorithm == "TS" or self.algorithm == "UCB-TS" or self.algorithm == "MTS":
             self.W += R
             self.Q = self.W/self.n
 
             support = self.support
             num_atoms = self.atoms
-            new_value = self.Q
+            new_value = R
             if new_value < support[0] or new_value > support[-1]:
                 new_support = np.linspace(min(support[0], new_value), max(support[-1], new_value), num_atoms)
-                new_categorical_distribution = np.zeros(num_atoms)
+                new_categorical_distribution = np.ones(num_atoms)
                 for i, value in enumerate(support):
                     new_categorical_distribution[np.argmin(np.abs(new_support - value))] = self.categorical_distribution[i]
                 self.support = new_support
                 self.categorical_distribution = new_categorical_distribution
-            
+                
+
             nearest_bin_index = np.argmin(np.abs(self.support - new_value))
             self.categorical_distribution[nearest_bin_index] += 1
-            
-
+        
+        if self.algorithm == "NPTS":
+            self.W += R
+            self.Q = self.W/self.n
+            new_value = R
+            # new_value = round(R, self.precision)
+            # new_value = round(self.Q, self.precision)
+            if new_value not in self.support:
+                self.support[new_value] = 1
+            else:
+                self.support[new_value] += 1
 
         elif self.algorithm == 'maxmcts':
             delta = R - self.Q
@@ -285,6 +325,12 @@ class State():
                             in zip(self.child_actions,self.priors)])
             winner = np.argmax(uct)
         
+        elif self.algorithm == "MTS":
+            uct = np.array([child_action.sample_dirichilet() + prior for child_action,prior in zip(self.child_actions,self.priors)])
+            winner = np.argmax(uct)
+        elif self.algorithm == "NPTS":
+            uct = np.array([child_action.sample_dirichilet_npts() for child_action,prior in zip(self.child_actions,self.priors)])
+            winner = np.argmax(uct)
         elif self.algorithm == 'rents':
             random = rand()
             Qs = [child_action.Q for child_action in self.child_actions]
@@ -408,17 +454,6 @@ class State():
             self.index = self.index.detach().cpu()
             Q_value = np.squeeze(self.Q.detach().cpu().numpy())
 
-            # log_priors = self.priors
-            # for index, value in enumerate(self.priors):
-            #     if value > 0:
-            #         log_priors[index] = np.log(value)
-            #     else:
-            #         log_priors[index] = 0
-
-            # self.child_actions = [
-            #     Action(a, parent_state=self, Q_init=log_priors[a],tau=self.tau,epsilon=self.epsilon,
-            #            lambda_const=self.lambda_const,algorithm=self.algorithm, p=self.p) for a in range(self.na)]
-
             self.child_actions = [
                 Action(a, parent_state=self, Q_init=(Q_value[a] - self.V)/self.tau,tau=self.tau,epsilon=self.epsilon,
                        lambda_const=self.lambda_const,algorithm=self.algorithm, p=self.p) for a in range(self.na)]
@@ -447,10 +482,11 @@ class State():
             max_Q = np.max(Q)
             MENT = [np.exp((child_action.Q - max_Q) / self.tau) for child_action in self.child_actions]
             self.V = max_Q + self.tau * np.log(np.sum(MENT))
-        elif self.algorithm == 'uct' or self.algorithm == 'maxmcts':
+        elif self.algorithm == 'uct' or self.algorithm == 'maxmcts' or self.algorithm == "TS" or self.algorithm == "UCB-TS":
             counts = np.array([child_action.n for child_action in self.child_actions])
             self.V = np.sum((counts / np.sum(counts)) * Q)
-        elif self.algorithm == 'power-uct':
+        # elif self.algorithm in ['power-uct', 'MTS','NPTS']:
+        elif self.algorithm in ['power-uct', 'MTS','NPTS']:
             self.V = 0.0
             counts = np.array([child_action.n for child_action in self.child_actions])
             for child_action in self.child_actions:
@@ -532,20 +568,12 @@ class MCTS():
             # Back-up
             R = state.V
             while state.parent_action is not None: # loop back-up until root is reached
-                if self.algorithm == 'rents' or self.algorithm == 'ments' or self.algorithm == 'tsallis':
+                if self.algorithm == 'rents' or self.algorithm == 'ments' or self.algorithm == 'tsallis' or self.algorithm == 'MTS' or self.algorithm == "NPTS":
                     R = state.V
                 R = state.r + self.gamma * R
                 action = state.parent_action
                 action.update(R)
                 state = action.parent_state
-                
-                
-                # print([c.n for c in state.child_actions])
-                # print([c.W for c in state.child_actions])
-                # print([child_action.Q + prior * c * (np.sqrt(state.n + 1)/(child_action.n + 1)) for child_action,prior
-                #             in zip(state.child_actions,state.priors)])
-                # print([(child_action.Q + 0.25*c*(np.sqrt(state.n + 1)/(child_action.n + 1))) for child_action in state.child_actions])
-
 
                 if self.algorithm == 'maxmcts':
                     Q = [child_action.Q for child_action in state.child_actions]
@@ -592,6 +620,10 @@ class MCTS():
             self.algorithm == "TS" or self.algorithm == "UCB-TS":
             pi_target = stable_normalizer(counts, temp)
 
+        elif self.algorithm == "MTS" or "NPTS":
+            Qs = [child_action.Q for child_action in self.root.child_actions]
+            print(Qs)
+            pi_target = Q 
         return self.root.index,pi_target,V_target
 
     def forward(self,a,s1):
@@ -642,14 +674,7 @@ def agent(algorithm,game,n_ep,n_mcts,max_ep_len,c,p,gamma,temp,tau,epsilon,lambd
             # MCTS step
             #print("GAME STEP : ",t)
             mcts.search(n_mcts=n_mcts, c=c, Env=Env, mcts_env=mcts_env)  # perform a forward search
-            distributions = np.array([(child_action.categorical_distribution,child_action.support)  for child_action in mcts.root.child_actions])
-            
-            #for dist, support in distributions:
-            #     print(f"Distribution : ")
-            #     print(f"{dist}")
-            #     print("Support : ")
-            #     print([round(i,2) for i in support])
-            # print("_____")
+            distributions = np.array([(child_action.categorical_distribution, child_action.support)  for child_action in mcts.root.child_actions])
             
             state, pi, V = mcts.return_results(temp)  # extract the root output
 
@@ -696,10 +721,11 @@ def experiment(algorithm,game,seed,n_mcts,max_ep_len,c,p,gamma,temp,tau,epsilon,
                                                                 epsilon=epsilon, lambda_const=lambda_const)
 
     folder_name = game[:6]
+    num_atoms = 100
     path = os.getcwd() + '/logs/dist/' + folder_name
     if not os.path.exists(path):
         os.mkdir(path)
-    filename = os.getcwd() + f'/logs/dist/{folder_name}/' + game + '_' + algorithm + '.txt' + str(tau) + '_' + \
+    filename = os.getcwd() + f'/logs/dist/{folder_name}/' + game + '_' + algorithm + '_' + str(num_atoms) +'.txt' + str(tau) + '_' + \
             str(epsilon) + f"_seed_{seed}"
     file = open(filename,"w+")
 
@@ -727,47 +753,7 @@ if __name__ == '__main__':
     parser.add_argument('--cuda', default=False,action='store_true')
     args = parser.parse_args()
 
-    pool = mp.Pool(processes=14)
-
-    # games = ["AlienNoFrameskip-v4", 
-    #         "EnduroNoFrameskip-v4"
-    #         "BreakoutNoFrameskip-v4",
-    #         "RobotankNoFrameskip-v4",
-    #         "SeaquestNoFrameskip-v4"]
-    
-    # games = ["EnduroNoFrameskip-v4"
-    #         "BreakoutNoFrameskip-v4",
-    #         "SpaceInvadersNoFrameskip-v4",
-    #         'DemonAttackNoFrameskip-v4',
-    #         "PhoenixNoFrameskip-v4",
-    #         'MsPacmanNoFrameskip-v4',
-    #         'NetsNoFrameskip-v4',
-    #         'PitfallNoFrameskip-v4',
-    #         'AsterixNoFrameskip-v4',
-    #         'BeamRiderNoFrameskip-v4']
-        
-    # games = ["AmidarNoFrameskip-v4",
-    #         "AsteroidsNoFrameskip",
-    #         "KrullNoFrameskip-v4",
-    #         "SolarisNoFrameskip-v4"]
-
-        # 'BankHeistNoFrameskip-v4': bank_heist,
-        # 'BowlingNoFrameskip-v4': bowling,
-        # 'CentipedeNoFrameskip-v4': centipede,
-        # 'GopherNoFrameskip-v4': gopher,
-        # 'WizardOfWorNoFrameskip-v4': wizard_of_wor,
-        # 'AtlantisNoFrameskip-v4': atlantis,
-        # 'FreewayNoFrameskip-v4': freeway,
-        # 'FrostbiteNoFrameskip-v4': frostbite,
-        # 'HeroNoFrameskip-v4': hero,
-        # 'NetsNoFrameskip-v4': nets,
-        # 'QbertNoFrameskip-v4': qbert,
-
-
-    # games = ["WizardOfWorNoFrameskip-v4",
-    # "BankHeistNoFrameskip-v4",
-    # "EnduroNoFrameskip-v4",
-    # "BreakoutNoFrameskip-v4"]
+    pool = mp.Pool(processes=12)
 
     games = [
         'PhoenixNoFrameskip-v4',
@@ -779,28 +765,39 @@ if __name__ == '__main__':
         'AsterixNoFrameskip-v4',
         'RobotankNoFrameskip-v4',
         'SeaquestNoFrameskip-v4',
-        'KrullNoFrameskip-v4',
+        #'KrullNoFrameskip-v4',
         'SolarisNoFrameskip-v4',
         'AsteroidsNoFrameskip-v4',
-        'QbertNoFrameskip-v4',
-        'BowlingNoFrameskip-v4',
+        #'BowlingNoFrameskip-v4',   
         'EnduroNoFrameskip-v4',
         'AtlantisNoFrameskip-v4',
         'GopherNoFrameskip-v4',
         'HeroNoFrameskip-v4',
         'FrostbiteNoFrameskip-v4',
         'WizardOfWorNoFrameskip-v4',
-        'FreewayNoFrameskip-v4',
+        #'FreewayNoFrameskip-v4',
         'BreakoutNoFrameskip-v4'
     ]
     
-    algorithms = ["uct", "TS", "UCB-TS"]
+    algorithms = ["NPTS","MTS"]
+    # algorithms = ["MTS"]
+    # games = ['SolarisNoFrameskip-v4']
+
     for game in games:
         for algorithm in algorithms:
+            # experiment(algorithm,
+            # game,
+            # seed,
+            # args.n_mcts,
+            # args.max_ep_len,
+            # args.c,
+            # args.p,
+            # args.gamma,
+            # args.temp,
+            # args.tau,
+            # args.epsilon,
+            # args.lambda_const)
             for seed in range(args.n_ep):
-                # experiment(algorithm=algorithm,game=game,n_ep=args.n_ep,n_mcts=args.n_mcts,
-                #                         max_ep_len=args.max_ep_len,c=args.c,p=args.p,gamma=args.gamma,
-                #                         temp=args.temp,tau=args.tau,epsilon=args.epsilon,lambda_const=args.lambda_const)
                     pool.apply_async(experiment,
                             args = (algorithm,
                             game,
@@ -816,6 +813,4 @@ if __name__ == '__main__':
                             args.lambda_const))
     pool.close()
     pool.join()
-
-
 print('Duration : ', time.time()-start, 'seconds.')
